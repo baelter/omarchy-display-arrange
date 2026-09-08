@@ -3,6 +3,8 @@
 An Omarchy shell bar widget for display settings, based on the built-in
 Display widget, with an added drag-to-arrange monitor layout.
 
+![Display Arrange panel showing brightness, text size, scale, display toggles, and the Arrange section with two monitors stacked vertically](screenshot.png)
+
 ## Features
 
 - Brightness slider (when the focused display has a controllable backlight)
