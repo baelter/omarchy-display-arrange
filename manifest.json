@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.baelter.display-arrange",
+  "name": "Display Arrange",
+  "version": "1.0.0",
+  "author": "baelter",
+  "license": "MIT",
+  "description": "Display widget with brightness, scale, and text-size controls, plus drag-to-arrange monitor layout",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Display Arrange",
+    "description": "Brightness, scale, and text-size controls, plus drag-to-arrange monitor layout",
+    "category": "System",
+    "allowMultiple": false
+  }
+}
