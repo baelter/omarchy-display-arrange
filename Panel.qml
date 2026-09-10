@@ -28,6 +28,17 @@ Panel {
   property int enabledDisplayCount: 0
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace("file://", "")
 
+  // Generation counters for the drag-to-arrange lock. `applyEpoch` ticks
+  // on every layoutApplyProc completion; `freshDisplaysEpoch` records the
+  // applyEpoch a displaysProc invocation was started against, updated at
+  // stream-finish. Dragging stays disabled until `freshDisplaysEpoch >=
+  // applyEpoch`, so `root.displays` has been re-polled after the apply
+  // (a poll that was already in flight when apply completed doesn't count
+  // — its data reflects pre-apply positions).
+  property int applyEpoch: 0
+  property int freshDisplaysEpoch: 0
+  readonly property bool layoutSettled: !layoutApplyProc.running && freshDisplaysEpoch >= applyEpoch
+
   // Carry sub-notch touchpad deltas between wheel events.
   property real wheelAccumulator: 0
 
@@ -235,27 +246,41 @@ Panel {
     if (!displaysProc.running) displaysProc.running = true
   }
 
-  // Drag-to-arrange drop: snap the raw drop position, apply it live via
-  // hyprctl, and persist it into monitors.lua so it survives a restart.
+  // Drag-to-arrange drop: snap the raw drop position, force adjacency so
+  // Hyprland's 2px STICKS test still passes, re-anchor the layout to (0, 0)
+  // to stop cumulative drift, then apply every changed display live and
+  // persist to monitors.lua. `hyprctl keyword monitor` is rejected under
+  // Hyprland's Lua config parser; the script does the live `hyprctl eval`.
+  //
+  // Drops that arrive before the model has caught up with the previous
+  // apply are ignored. Queuing one safely means replaying against a model
+  // that reflects the just-applied layout (including any re-anchor shift),
+  // and refresh() can race with a periodic poll started before the apply
+  // — so any raw coords we held would translate incorrectly. The drag
+  // MouseArea below is gated on `layoutSettled`, so this early-return
+  // is a belt-and-braces guard the user does not hit in practice.
   function applyLayout(display, rawX, rawY) {
+    if (!root.layoutSettled) return
     var snapped = Model.snapPosition(display.name, rawX, rawY, root.displays, 24)
-    // Hyprland rejects an overlapping layout outright; never hand it one.
     snapped = Model.resolveOverlap(display.name, snapped.x, snapped.y, root.displays)
-    var mode = display.width + "x" + display.height + "@" + display.refreshRate
-    var transform = display.transform || 0
-    var transformField = transform !== 0 ? (", transform = " + transform) : ""
-    var position = snapped.x + "x" + snapped.y
+    snapped = Model.enforceAdjacency(display.name, snapped.x, snapped.y, root.displays)
+    snapped = Model.resolveOverlap(display.name, snapped.x, snapped.y, root.displays)
 
-    // `hyprctl keyword monitor` is rejected under Hyprland's Lua config
-    // parser; `hyprctl eval` running the hl.monitor() call is the live path.
-    var lua = 'hl.monitor({ output = "' + display.name + '", mode = "' + mode +
-      '", position = "' + position + '", scale = ' + display.scale + transformField + ' })'
-    layoutLiveProc.command = ["hyprctl", "eval", lua]
-    if (!layoutLiveProc.running) layoutLiveProc.running = true
+    var anchored = Model.anchorLayout(root.displays, { name: display.name, x: snapped.x, y: snapped.y })
 
-    layoutPersistProc.command = ["bash", root.pluginDir + "apply-layout.sh", display.name,
-      String(snapped.x), String(snapped.y), mode, String(display.scale), String(transform)]
-    if (!layoutPersistProc.running) layoutPersistProc.running = true
+    var argv = ["bash", root.pluginDir + "apply-layout.sh"]
+    for (var i = 0; i < anchored.length; i++) {
+      var d = anchored[i]
+      var orig = root.displays[i]
+      if (!d || !d.enabled) continue
+      if (d.name !== display.name && orig && orig.x === d.x && orig.y === d.y) continue
+      var mode = d.width + "x" + d.height + "@" + d.refreshRate
+      var transform = d.transform || 0
+      argv.push(d.name, String(d.x), String(d.y), mode, String(d.scale), String(transform))
+    }
+    if (argv.length <= 2) return
+    layoutApplyProc.command = argv
+    layoutApplyProc.running = true
   }
 
   function setBrightness(value) {
@@ -440,12 +465,20 @@ Panel {
   // arrange-layout drag UI below.
   Process {
     id: displaysProc
+    property int startedForEpoch: 0
     command: ["bash", "-c",
       "hyprctl monitors all -j | jq -c '[.[] | {name, enabled:(.disabled != true), " +
       "focused:(.focused == true), width, height, x, y, scale, transform, refreshRate}]'"]
+    onRunningChanged: if (running) startedForEpoch = root.applyEpoch
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.updateDisplays(text)
+      onStreamFinished: {
+        root.updateDisplays(text)
+        root.freshDisplaysEpoch = displaysProc.startedForEpoch
+        // If this poll started before the last apply completed, its data
+        // is pre-apply — kick another one to unlock the drag area.
+        if (root.freshDisplaysEpoch < root.applyEpoch) displaysProc.running = true
+      }
     }
   }
 
@@ -481,14 +514,15 @@ Panel {
   }
 
   Process {
-    id: layoutLiveProc
+    id: layoutApplyProc
     stdout: StdioCollector { waitForEnd: true }
-    onRunningChanged: if (!running) root.refresh()
-  }
-
-  Process {
-    id: layoutPersistProc
-    stdout: StdioCollector { waitForEnd: true }
+    onRunningChanged: {
+      if (running) return
+      root.applyEpoch++
+      // Kick a poll if none is running; if one is running, its onStream-
+      // Finished sees a stale epoch and kicks another itself.
+      if (!displaysProc.running) displaysProc.running = true
+    }
   }
 
   // Applies text size via the CLI, which rewrites the shell override file;
@@ -986,13 +1020,19 @@ Panel {
 
     MouseArea {
       anchors.fill: parent
+      // Locked while the previous drop's apply is still in flight OR a
+      // post-apply displays poll hasn't returned yet. The apply's own
+      // exit isn't enough — `refresh()` is asynchronous and a periodic
+      // poll started pre-apply can land afterward with stale positions.
+      // See the applyEpoch / freshDisplaysEpoch generation counters up top.
+      enabled: root.layoutSettled
       drag.target: tile
       drag.axis: Drag.XAndYAxis
       drag.minimumX: 0
       drag.maximumX: Math.max(tile.areaWidth - tile.width, 0)
       drag.minimumY: 0
       drag.maximumY: Math.max(tile.areaHeight - tile.height, 0)
-      cursorShape: Qt.SizeAllCursor
+      cursorShape: enabled ? Qt.SizeAllCursor : Qt.ArrowCursor
 
       onPressed: tile.dragging = true
       onReleased: {

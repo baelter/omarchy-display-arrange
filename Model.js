@@ -113,10 +113,15 @@ function parseDisplays(raw) {
 
 function logicalSize(display) {
   var scale = Number(display && display.scale) || 1
-  return {
-    width: Number(display.width) / scale,
-    height: Number(display.height) / scale
-  }
+  var w = Number(display.width) / scale
+  var h = Number(display.height) / scale
+  // hyprctl monitors -j reports the untransformed mode dimensions.
+  // Hyprland swaps width/height for odd transforms (1=90°, 3=270°, and
+  // the flipped-rotated variants 5, 7). Match that so the adjacency
+  // guarantee holds for portrait/rotated displays.
+  var transform = Number(display && display.transform) || 0
+  if (transform % 2 === 1) return { width: h, height: w }
+  return { width: w, height: h }
 }
 
 // Bounding box (in logical/layout coordinates) covering every enabled display.
@@ -181,15 +186,120 @@ function snapPosition(name, rawX, rawY, displays, threshold) {
 
   function nearest(value, candidates) {
     var best = value
-    var bestDist = threshold
+    var bestDist = Infinity
+    var found = false
     for (var k = 0; k < candidates.length; k++) {
       var dist = Math.abs(candidates[k] - value)
-      if (dist <= bestDist) { bestDist = dist; best = candidates[k] }
+      // Inclusive threshold (a candidate exactly `threshold` away still
+      // snaps), first-match wins so ties are deterministic.
+      if (dist > threshold) continue
+      if (!found || dist < bestDist) { bestDist = dist; best = candidates[k]; found = true }
     }
     return Math.round(best)
   }
 
   return { x: nearest(rawX, candidatesX), y: nearest(rawY, candidatesY) }
+}
+
+// After threshold-based snapping, if the dragged display still doesn't touch
+// any other enabled display along a shared edge, snap unconditionally to the
+// nearest edge candidate whose perpendicular projection overlaps ours. Keeps
+// the layout adjacent — Hyprland's directional monitor lookup uses a 2px
+// STICKS test, so a sloppy drop that lands outside snap threshold otherwise
+// silently breaks `movecurrentworkspacetomonitor l/r/u/d`.
+function enforceAdjacency(name, x, y, displays) {
+  var self = null
+  for (var i = 0; i < displays.length; i++) {
+    if (displays[i] && displays[i].name === name) { self = displays[i]; break }
+  }
+  if (!self) return { x: Math.round(x), y: Math.round(y) }
+  var selfSize = logicalSize(self)
+
+  var others = []
+  for (var i = 0; i < displays.length; i++) {
+    var o = displays[i]
+    if (!o || !o.enabled || o.name === name) continue
+    others.push({ d: o, s: logicalSize(o) })
+  }
+  if (others.length === 0) return { x: Math.round(x), y: Math.round(y) }
+
+  for (var i = 0; i < others.length; i++) {
+    var od = others[i].d, os = others[i].s
+    var xTouchRight = Math.abs((x + selfSize.width) - od.x) < 1
+    var xTouchLeft = Math.abs(x - (od.x + os.width)) < 1
+    var yOverlap = (y < od.y + os.height) && (y + selfSize.height > od.y)
+    if ((xTouchRight || xTouchLeft) && yOverlap) return { x: Math.round(x), y: Math.round(y) }
+    var yTouchBottom = Math.abs((y + selfSize.height) - od.y) < 1
+    var yTouchTop = Math.abs(y - (od.y + os.height)) < 1
+    var xOverlap = (x < od.x + os.width) && (x + selfSize.width > od.x)
+    if ((yTouchBottom || yTouchTop) && xOverlap) return { x: Math.round(x), y: Math.round(y) }
+  }
+
+  var best = null
+  var bestDist = Infinity
+  for (var i = 0; i < others.length; i++) {
+    var od = others[i].d, os = others[i].s
+    // Clamp the perpendicular coordinate into the range where the pair's
+    // projections overlap. A diagonally separated drop otherwise keeps the
+    // raw perp coord, so nothing overlaps and adjacency silently drops.
+    var yMin = od.y - selfSize.height + 1
+    var yMax = od.y + os.height - 1
+    var yClamped = Math.max(yMin, Math.min(yMax, y))
+    var xMin = od.x - selfSize.width + 1
+    var xMax = od.x + os.width - 1
+    var xClamped = Math.max(xMin, Math.min(xMax, x))
+    var candidates = [
+      { x: od.x + os.width, y: yClamped },
+      { x: od.x - selfSize.width, y: yClamped },
+      { x: xClamped, y: od.y + os.height },
+      { x: xClamped, y: od.y - selfSize.height }
+    ]
+    for (var c = 0; c < candidates.length; c++) {
+      var cand = candidates[c]
+      var d = Math.abs(cand.x - x) + Math.abs(cand.y - y)
+      if (d < bestDist) { bestDist = d; best = cand }
+    }
+  }
+  // Every enumerated candidate has clamped-overlap perpendicular coords, so
+  // `best` is set whenever `others` was non-empty; the early return above
+  // handles the empty case. This return is therefore always the snapped
+  // point, never the raw input.
+  return { x: Math.round(best.x), y: Math.round(best.y) }
+}
+
+// Substitute `override` (if given) for its named display, then translate the
+// whole layout so the top-left of the bounding box is at (0, 0). Prevents the
+// cumulative drift where each drop snapped against the previous drift.
+function anchorLayout(displays, override) {
+  var effective = []
+  for (var i = 0; i < displays.length; i++) {
+    var d = displays[i]
+    if (!d) { effective.push(d); continue }
+    if (override && d.name === override.name) {
+      var copy = {}
+      for (var k in d) copy[k] = d[k]
+      copy.x = override.x
+      copy.y = override.y
+      effective.push(copy)
+    } else {
+      effective.push(d)
+    }
+  }
+  var bounds = computeLayoutBounds(effective)
+  if (!isFinite(bounds.minX) || !isFinite(bounds.minY)) return effective
+  if (bounds.minX === 0 && bounds.minY === 0) return effective
+
+  var anchored = []
+  for (var i = 0; i < effective.length; i++) {
+    var d = effective[i]
+    if (!d || !d.enabled) { anchored.push(d); continue }
+    var copy = {}
+    for (var k in d) copy[k] = d[k]
+    copy.x = Math.round(d.x - bounds.minX)
+    copy.y = Math.round(d.y - bounds.minY)
+    anchored.push(copy)
+  }
+  return anchored
 }
 
 function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
@@ -257,6 +367,8 @@ if (typeof module !== "undefined") {
     computeLayoutBounds: computeLayoutBounds,
     computeLayoutCapacity: computeLayoutCapacity,
     snapPosition: snapPosition,
-    resolveOverlap: resolveOverlap
+    resolveOverlap: resolveOverlap,
+    enforceAdjacency: enforceAdjacency,
+    anchorLayout: anchorLayout
   }
 }

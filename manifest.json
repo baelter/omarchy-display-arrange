@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.baelter.display-arrange",
   "name": "Display Arrange",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "baelter",
   "license": "MIT",
   "description": "Display widget with brightness, scale, and text-size controls, plus drag-to-arrange monitor layout",
